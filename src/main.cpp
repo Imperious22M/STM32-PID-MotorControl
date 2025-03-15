@@ -15,132 +15,297 @@
 #error "Due to API change, this sketch is compatible with STM32_CORE_VERSION  >= 0x01090000"
 #endif
 
+
+// Debug Flags
+#define PID_DEBUG 0
+
+
+// Qudrature decoder pin definitions
 #define T1CH1_Pin PA8 // Quadrature A channel input pin
 #define T1CH2_Pin PA9 // Quadrature B channel input pin
-#define ticksPerRevolution 50*4 // Number of "ticks" per revolution
-#define teethNum 25 // number of teeth the gear has
 
-// SPI pins for CAN Module
-#define MOSI_CAN PA7 
-#define MISO_CAN PA6
-#define SCK_CAN  PA5
-#define CS_CAN   PA4
-#define CS_PIN    PA4
-// Set CAN bus baud rate
-#define CAN_BAUDRATE (250000)
+// Motor pin definitions
+#define ENA PB8
+#define IN1 PB7
+#define IN2 PB6
+#define ticksPerRevolution 1800 // Number of "ticks" per revolution
 
-// Speed update is at a rate of 1 ms
-#define SPEED_UPDATE_RATE_HZ 10 // The rate at which speed is updated in Hz 
-const float speedTimeRate =  1.0/SPEED_UPDATE_RATE_HZ;
+// Speed update rate in HZ
+#define SPEED_UPDATE_RATE_HZ 20
+const float speedTimeRate =  1.0/SPEED_UPDATE_RATE_HZ; // Period of update rate
+volatile uint16_t prevTickCnt = 0; // Previously stored Tick Count, initialized to zero upon reset
+volatile float ticksPerSec = 0; // Revolutions per second of the encoder shaft
 
-#define CAN_UPDATE_RATE_HZ 10 // The rate at which CAN messages are transmited in Hz
+// PID settings
+int targetTick = 1800;
+// works for 12 bit resolution at 10Hz 
+//float Kp = 0.05; // Proportional gain
+//float Ki = 0.3*speedTimeRate; // Integral gain per unit time
+//float Kd = 0.3/speedTimeRate; // Derivative gain per unit time
+// works for 16 bit resolution at 10Hz
+//float Kp = 10; // Proportional gain
+//float Ki = 10*speedTimeRate; // Integral gain per unit time
+//float Kd = 3/speedTimeRate; // Derivative gain per unit time
+// Manual Mode (set manually by variable resistors)
+float Kp = 0 ; // Proportional gain
+float Ki = 0*speedTimeRate; // Integral gain per unit time
+float Kd = 0/speedTimeRate; // Derivative gain per unit time
 
-// Function signature of speed calculation interrupt
+float integral = 0;
+float derivative = 0;
+float outputMin,outputMax; // Output limits
+int output = 0; // PWM output value
+
+// PWM settings
+#define PWM_RES 16 // PWM resolution in bits
+const int PWM_MAX = (1 << PWM_RES) - 1; // Maximum PWM value
+
+// Variable Resistor Pins
+#define TickRes PB1
+#define KpRes PB0
+#define KiRes PA7
+#define KdRes PA6
+
 void calcTickPerSec();
-
-// Function signature to send speed and direction to CAN bus
 void sendCANMessage();
+void PIDControl(int targetSpeed, int currentSpeed);
+void PIDSetOutputLimits(float min, float max);
+void PIDSetTunings(float Kp, float Ki, float Kd);
 
 // Create an QuadratureDecoder object, this wraps around the functionality of the decoder
 // The Timer used MUST support Quadrature decoding, otherwise the functions will not work
 QuadratureDecoder quadDecoder(TIM1, T1CH1_Pin, T1CH2_Pin);
+// Speed timer used to calculate speed and run PID loop
+HardwareTimer *SpeedTimer = new HardwareTimer(TIMER_SERVO);
 
-// Hardware timer to send information to the CAN bus at a rate of 100 Hz
-HardwareTimer *CANTimer = new HardwareTimer(TIM4);
-
-// Timer Timer
-HardwareTimer *SpeedTimer = new HardwareTimer(TIM3);
-
-// CAN Controller object
-Adafruit_MCP2515 mcp(CS_CAN,MOSI_CAN,MISO_CAN,SCK_CAN);
-
-// Send a CAN message with speed and direction
-void sendCanMessage(){
-  mcp.beginPacket(0x12);
-  mcp.write('a');
-  mcp.write('a');
-  mcp.write('a');
-  mcp.write('a');
-  mcp.write('a');
-  mcp.endPacket();
-}
-
-
-volatile uint32_t overflowTime = 0; // 
-// Revolutions per second of the encoder shaft
-volatile float ticksPerSec = 0;
-// Revolutions per Millisond
-volatile float revMillisecond = 0;
-
-// Previously stored Tick Count, initialized to zero upon reset
-volatile uint16_t prevTickCnt = 0;
-void calcTickPerSec()
+// Calculates ticks/second at  a rate of SPEED_UPDATE_HZ
+// Use direction as discriminant and account for over/underflow
+void calcTickPerSecSimple()
 {
   uint32_t curTickCnt = quadDecoder.getCountQuad(TICK_FORMAT);
-  if(prevTickCnt == curTickCnt){
-    overflowTime++;
-    // If one second has passed with no new ticks, reset the overflow time
-    // and assume speed is 0
-    if(overflowTime > SPEED_UPDATE_RATE_HZ){
-      // If the overflow time is greater than 1 second, reset the overflow time
-      overflowTime = 0;
-      ticksPerSec = 0;
-    }
-    return;
-  }else {
-    // Calculate the number of ticks per second
-    double timeExtra = 0;
+  //bool direction = quadDecoder.getDirBit(); // 0 = forward, 1 = backward 
+  static int dirAvg = 0;
+  bool effectiveDirection = 0; // same as direction, but averaged over some refresh cycles
+  const int averageCycles = 5; // Number of cycles to average over
+  // Average direction over some refresh cycles
+  // HARDCODED because of erroneous behavior of the encoder
+  bool direction = 0;  
+  effectiveDirection = 0; // HARDCODED because of erroneous behavior of the encoder
 
-    // Calculate the number of time that has passed since the last tick
-    if(overflowTime > 0){
-      timeExtra = (float)overflowTime/SPEED_UPDATE_RATE_HZ;
-      overflowTime = 0;
+  if(prevTickCnt == curTickCnt){
+      ticksPerSec = 0;
+  }else {
+    // Calculate Ticks/Second based on direction
+    if(effectiveDirection == 0){
+
+      // Account for overflow
+      if(prevTickCnt>curTickCnt){
+        ticksPerSec = (curTickCnt + (UINT16_MAX - prevTickCnt - 1)) / (speedTimeRate);
+      }else{
+        ticksPerSec = (curTickCnt - prevTickCnt) / (speedTimeRate);
+      }
+
+    } else { 
+
+      // TODO OVERFLOW ACCOUNTING for reverse direction
+      //digitalWrite(PB5,1);
+      //ticksPerSec = (prevTickCnt - curTickCnt) / (speedTimeRate);
     }
-    ticksPerSec = (curTickCnt - prevTickCnt) / (speedTimeRate + timeExtra);
+
+
+    if(ticksPerSec>UINT16_MAX){
+      Serial.println("Overflow error! Ticks per second is too high!");
+      Serial.print("Ticks per second: ");
+      Serial.println(ticksPerSec);  
+      Serial.print("Current tick count: ");
+      Serial.println(curTickCnt);
+      Serial.print("Previous tick count: ");
+      Serial.println(prevTickCnt);
+      Serial.print("Direction: ");
+      Serial.println(direction);
+      Serial.println("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
+      Serial.println();
+    }
+    
     prevTickCnt = curTickCnt;
+
   }
 
+  //Serial.print("millis:");
+  //Serial.println(millis());
+  // run PID loop
+  PIDControl(targetTick, ticksPerSec); // Set target speed to 2000 RPM
+}
+// Debug print of Encoder readings
+void debugEncoderReadings(){
+  //Serial.print("Encoder Count:");
+  //Serial.println(quadDecoder.getCountQuad(TICK_FORMAT));
+  Serial.print("Direction:");
+  //Serial.println(quadDecoder.getDirBit()? "Backward":"Forward");
+  Serial.println(quadDecoder.getDirBit());
+  Serial.print("Ticks_per_second:");
+  Serial.println(ticksPerSec);
+  Serial.print("RPS:");
+  Serial.println(ticksPerSec/ticksPerRevolution);
+  Serial.print("RPM:");
+  Serial.println(ticksPerSec/ticksPerRevolution*60);
+  //Serial.println("~~~~");
+}
+// Implement PID control of motor PWM
+// Based on: http://brettbeauregard.com/blog/2011/04/improving-the-beginners-pid-direction/
+void PIDControl(int targetSpeed, int currentSpeed)
+{
+  static float error = 0;
+  static float prevError = 0;
+  static float lastSpeed = 0;
+
+  // current speed can't be 0 or the entire PID loop will break
+  if(currentSpeed == 0){
+    currentSpeed = 1;
+  }
+
+  // Calculate error
+  error = targetSpeed - currentSpeed;
+  // Calculate integral
+  integral += Ki * error;
+  // Clamp to usable range
+  if(integral> outputMax) integral = outputMax;
+  else if(integral < outputMin) integral = outputMin;
+  
+  // Calculate derivative
+  //derivative = error - prevError;
+  derivative = (currentSpeed-lastSpeed);
+  
+  // Calculate output
+  //output = Kp * error + Ki * integral + Kd * derivative; (old way)
+  output = Kp * error + integral - Kd * derivative; 
+  if(output> outputMax) output = outputMax;
+  else if(output < outputMin) output = outputMin;
+
+  // Constrain output to PWM range
+  output = constrain(output, 0, PWM_MAX);
+  // Set motor speed
+  analogWrite(ENA, output);
+  //Serial.println(output);
+
+  // Update previous error
+  prevError = error;
+  lastSpeed = currentSpeed;
+
+  if(PID_DEBUG){
+    // Print PID values for debugging
+    Serial.print("Target Speed: ");
+    Serial.print(targetSpeed);
+    Serial.print(" RPM, Current Speed: ");
+    Serial.print(currentSpeed);
+    Serial.print(" RPM, Error: ");
+    Serial.print(error);
+    Serial.print(", Integral: ");
+    Serial.print(integral);
+    Serial.print(", Derivative: ");
+    Serial.print(derivative);
+   // Serial.print(", Kp: ");
+   // Serial.print(Kp);
+   // Serial.print(", Ki: ");
+   // Serial.print(Ki);
+   // Serial.print(", Kd: ");
+   // Serial.print(Kd);
+   Serial.print(", Output: ");
+    Serial.println(output);
+  }
+
+
+}
+// Set output limits for PID controller
+void PIDSetOutputLimits(float min, float max)
+{
+   if(min > max) return;
+   outputMin = min;
+   outputMax = max;
+    
+   if(output > outputMax) output = outputMax;
+   else if(output < outputMin) output = outputMin;
+ 
+   if(integral> outputMax) integral= outputMax;
+   else if(integral< outputMin) integral= outputMin;
+}
+// Set tunings for PID
+void PIDSetTunings(float Kp_in, float Ki_in, float Kd_in)
+{
+  if(Kp_in < 0 || Ki_in < 0 || Kd_in < 0) return;
+  // Set PID tunings
+  Kp = Kp_in;
+  Ki = Ki_in * speedTimeRate;
+  Kd = Kd_in / speedTimeRate;
+}
+
+// Serial print of variable resistor values
+void debugVarRes(){
+  Serial.println("Analog Readings:");
+  Serial.print("TickRes: ");
+  Serial.println(analogRead(TickRes));
+  Serial.print("KpRes: ");
+  Serial.println(analogRead(KpRes));
+  Serial.print("KiRes: ");
+  Serial.println(analogRead(KiRes));  
+  Serial.print("KdRes: ");
+  Serial.println(analogRead(KdRes));
+  Serial.println("~~~~");
 }
 
 void setup()
 {
   Serial.begin(9600);
 
-  // Setup CAN update Timer
-  CANTimer->setOverflow(CAN_UPDATE_RATE_HZ,HERTZ_FORMAT); // Send CAN messages at the set Hz rate
-  CANTimer->attachInterrupt(sendCanMessage);
-  //Start CAN timer
-  //CANTimer->resume();
+  // Motor control pins setup
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
 
+  // debug reverse encoder directionpin 
+  pinMode(PB5,OUTPUT);
+
+  // Analog input pins
+  analogReadResolution(PWM_RES);
+  pinMode(TickRes, INPUT_ANALOG);
+  pinMode(KpRes, INPUT_ANALOG);
+  pinMode(KiRes, INPUT_ANALOG);
+  pinMode(KdRes, INPUT_ANALOG);
+
+  // Motor control setup
+  analogWriteResolution(PWM_RES); // Set PWM resolution
+  //analogWrite(ENA, PWM_MAX/2); // Set PWM to 50% duty cycle
+  digitalWrite(IN1, 1);
+  digitalWrite(IN2, 0);
+  PIDSetOutputLimits(0, PWM_MAX); // Set output limits for PID controller
+  
   // Start speed timer
   SpeedTimer->setOverflow(SPEED_UPDATE_RATE_HZ,HERTZ_FORMAT); // Update speed at the set Hz rate
-  SpeedTimer->attachInterrupt(calcTickPerSec); // Attach the speed calculation function to the timer
+  SpeedTimer->attachInterrupt(calcTickPerSecSimple); // Attach the speed calculation function to the timer
   SpeedTimer->resume();
 
-  pinMode(CS_PIN,OUTPUT);
-
-  // The amazon CAN modules have 8 Mhz crystals by default
-  mcp.setClockFrequency(8e6);
-
-  // If CAN controller is not found, fail to read encoders
-  if (!mcp.begin(CAN_BAUDRATE)) {
-    while(1) {
-    delay(1000);
-    Serial.println("Error initializing MCP2515.");
-    }
-  }
-
+  delay(1000);
 }
 
 void loop()
 {
-  Serial.print("Encoder Count: ");
-  Serial.println(quadDecoder.getCountQuad(TICK_FORMAT));
-  Serial.print("Direction: ");
-  Serial.println(quadDecoder.getDirBit()? "Backward":"Forward");
-  Serial.println(quadDecoder.getDirBit());
-  Serial.print("Ticks per second: ");
-  Serial.println(ticksPerSec);
-  Serial.println("~~~~");
+  debugEncoderReadings();
   delay(100);
+
+
+  targetTick = map(analogRead(TickRes),0,PWM_MAX,0,3000);
+  Serial.print("Target_Tick:");  
+  Serial.println(targetTick);
+  float Kp_loc = map(analogRead(KpRes),0,PWM_MAX,0,1000);
+  float Ki_loc = map(analogRead(KiRes),0,PWM_MAX,0,1000)/1.0;
+  float Kd_loc = map(analogRead(KdRes),0,PWM_MAX,0,10);
+  //Kd_loc = 0;
+  PIDSetTunings(Kp_loc, Ki_loc, Kd_loc);
+  Serial.print("Kp:");
+  Serial.println(Kp_loc);
+  Serial.print("Ki:");
+  Serial.println(Ki_loc);
+  Serial.print("Kd:");
+  Serial.println(Kd_loc);
+  //debugVarRes();
 }
