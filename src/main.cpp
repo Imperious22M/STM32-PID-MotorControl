@@ -4,21 +4,17 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_MCP2515.h>
-
+#include <pidController.h>
+#include <motorController.h>
 
 /*
-  Quadrature Decoder example using hardware timer 1 (Ch1 and Ch2)
-  4x mode, with hardware filtering and edge detection
+  PID control of a motor using a quadrature encoder for feedback
+  Author: Scott Roelker
 */
 
 #if !defined(STM32_CORE_VERSION) || (STM32_CORE_VERSION  < 0x01090000)
 #error "Due to API change, this sketch is compatible with STM32_CORE_VERSION  >= 0x01090000"
 #endif
-
-
-// Debug Flags
-#define PID_DEBUG 0
-
 
 // Qudrature decoder pin definitions
 #define T1CH1_Pin PA8 // Quadrature A channel input pin
@@ -34,27 +30,7 @@
 #define SPEED_UPDATE_RATE_HZ 20
 const float speedTimeRate =  1.0/SPEED_UPDATE_RATE_HZ; // Period of update rate
 volatile uint16_t prevTickCnt = 0; // Previously stored Tick Count, initialized to zero upon reset
-volatile float ticksPerSec = 0; // Revolutions per second of the encoder shaft
-
-// PID settings
-int targetTick = 1800;
-// works for 12 bit resolution at 10Hz 
-//float Kp = 0.05; // Proportional gain
-//float Ki = 0.3*speedTimeRate; // Integral gain per unit time
-//float Kd = 0.3/speedTimeRate; // Derivative gain per unit time
-// works for 16 bit resolution at 10Hz
-//float Kp = 10; // Proportional gain
-//float Ki = 10*speedTimeRate; // Integral gain per unit time
-//float Kd = 3/speedTimeRate; // Derivative gain per unit time
-// Manual Mode (set manually by variable resistors)
-float Kp = 0 ; // Proportional gain
-float Ki = 0*speedTimeRate; // Integral gain per unit time
-float Kd = 0/speedTimeRate; // Derivative gain per unit time
-
-float integral = 0;
-float derivative = 0;
-float outputMin,outputMax; // Output limits
-int output = 0; // PWM output value
+volatile float ticksPerSec = 0; // Ticks per second of the encoder
 
 // PWM settings
 #define PWM_RES 16 // PWM resolution in bits
@@ -66,52 +42,56 @@ const int PWM_MAX = (1 << PWM_RES) - 1; // Maximum PWM value
 #define KiRes PA7
 #define KdRes PA6
 
+// Debugging Flags
+#define DEBUG_MANUAL_PID 1
+#define DEBUG_VAR_RES_RAW 0
+#define DEBUG_ENCODER_READINGS 1
+
 void calcTickPerSec();
-void sendCANMessage();
-void PIDControl(int targetSpeed, int currentSpeed);
-void PIDSetOutputLimits(float min, float max);
-void PIDSetTunings(float Kp, float Ki, float Kd);
 
 // Create an QuadratureDecoder object, this wraps around the functionality of the decoder
 // The Timer used MUST support Quadrature decoding, otherwise the functions will not work
 QuadratureDecoder quadDecoder(TIM1, T1CH1_Pin, T1CH2_Pin);
 // Speed timer used to calculate speed and run PID loop
 HardwareTimer *SpeedTimer = new HardwareTimer(TIMER_SERVO);
+// PID Controller for motor PWM control
+PIDController pidController(speedTimeRate, 0, PWM_MAX, 0, 0, 0); 
+int targetTick = 1800; // Target speed in ticks/second
+// Motor Controller initialization
+motorController motorControl = motorController(ENA, IN1, IN2,PWM_RES);
+motorController::motorDirection motorDir = motorController::FORWARD;
 
 // Calculates ticks/second at  a rate of SPEED_UPDATE_HZ
 // Use direction as discriminant and account for over/underflow
 void calcTickPerSecSimple()
 {
   uint32_t curTickCnt = quadDecoder.getCountQuad(TICK_FORMAT);
-  //bool direction = quadDecoder.getDirBit(); // 0 = forward, 1 = backward 
-  static int dirAvg = 0;
-  bool effectiveDirection = 0; // same as direction, but averaged over some refresh cycles
-  const int averageCycles = 5; // Number of cycles to average over
-  // Average direction over some refresh cycles
-  // HARDCODED because of erroneous behavior of the encoder
   bool direction = 0;  
-  effectiveDirection = 0; // HARDCODED because of erroneous behavior of the encoder
+  static int prevDirection = quadDecoder.getDirBit();
 
   if(prevTickCnt == curTickCnt){
       ticksPerSec = 0;
   }else {
     // Calculate Ticks/Second based on direction
-    if(effectiveDirection == 0){
 
-      // Account for overflow
-      if(prevTickCnt>curTickCnt){
-        ticksPerSec = (curTickCnt + (UINT16_MAX - prevTickCnt - 1)) / (speedTimeRate);
-      }else{
+    if(curTickCnt>prevTickCnt){
         ticksPerSec = (curTickCnt - prevTickCnt) / (speedTimeRate);
-      }
-
+        direction = 0;
     } else { 
-
-      // TODO OVERFLOW ACCOUNTING for reverse direction
-      //digitalWrite(PB5,1);
-      //ticksPerSec = (prevTickCnt - curTickCnt) / (speedTimeRate);
+      // Account for overflow
+        ticksPerSec = (prevTickCnt - curTickCnt) / (speedTimeRate);
+        direction = 1;
     }
 
+    // If we have overflowed, assume the quadrature counter has also overflowed
+    // and correct the count to account for this
+    if(ticksPerSec>UINT16_MAX){
+      if(direction==0){
+        ticksPerSec = (prevTickCnt + (UINT16_MAX - curTickCnt - 1)) / (speedTimeRate);
+      }else{
+        ticksPerSec = (curTickCnt + (UINT16_MAX - prevTickCnt - 1)) / (speedTimeRate);
+      }
+    }
 
     if(ticksPerSec>UINT16_MAX){
       Serial.println("Overflow error! Ticks per second is too high!");
@@ -125,24 +105,34 @@ void calcTickPerSecSimple()
       Serial.println(direction);
       Serial.println("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
       Serial.println();
+      return;
     }
     
     prevTickCnt = curTickCnt;
-
   }
 
-  //Serial.print("millis:");
-  //Serial.println(millis());
   // run PID loop
-  PIDControl(targetTick, ticksPerSec); // Set target speed to 2000 RPM
+  int localTargetTick = targetTick;
+  // PID controller only takes positive values,
+  // so we need to account for the reverse direction
+  if(targetTick<0){
+    localTargetTick = -targetTick;
+    motorControl.setDirection(motorController::BACKWARD);
+    motorDir = motorController::BACKWARD;
+  }else{
+    motorControl.setDirection(motorController::FORWARD);
+    motorDir = motorController::FORWARD;
+  }
+  int motorPWM = pidController.control(localTargetTick, ticksPerSec); 
+  motorControl.setPWMOut(motorPWM); // Set motor PWM
 }
 // Debug print of Encoder readings
 void debugEncoderReadings(){
   //Serial.print("Encoder Count:");
   //Serial.println(quadDecoder.getCountQuad(TICK_FORMAT));
-  Serial.print("Direction:");
+  //Serial.print("Direction:");
   //Serial.println(quadDecoder.getDirBit()? "Backward":"Forward");
-  Serial.println(quadDecoder.getDirBit());
+  //Serial.println(quadDecoder.getDirBit());
   Serial.print("Ticks_per_second:");
   Serial.println(ticksPerSec);
   Serial.print("RPS:");
@@ -151,96 +141,8 @@ void debugEncoderReadings(){
   Serial.println(ticksPerSec/ticksPerRevolution*60);
   //Serial.println("~~~~");
 }
-// Implement PID control of motor PWM
-// Based on: http://brettbeauregard.com/blog/2011/04/improving-the-beginners-pid-direction/
-void PIDControl(int targetSpeed, int currentSpeed)
-{
-  static float error = 0;
-  static float prevError = 0;
-  static float lastSpeed = 0;
-
-  // current speed can't be 0 or the entire PID loop will break
-  if(currentSpeed == 0){
-    currentSpeed = 1;
-  }
-
-  // Calculate error
-  error = targetSpeed - currentSpeed;
-  // Calculate integral
-  integral += Ki * error;
-  // Clamp to usable range
-  if(integral> outputMax) integral = outputMax;
-  else if(integral < outputMin) integral = outputMin;
-  
-  // Calculate derivative
-  //derivative = error - prevError;
-  derivative = (currentSpeed-lastSpeed);
-  
-  // Calculate output
-  //output = Kp * error + Ki * integral + Kd * derivative; (old way)
-  output = Kp * error + integral - Kd * derivative; 
-  if(output> outputMax) output = outputMax;
-  else if(output < outputMin) output = outputMin;
-
-  // Constrain output to PWM range
-  output = constrain(output, 0, PWM_MAX);
-  // Set motor speed
-  analogWrite(ENA, output);
-  //Serial.println(output);
-
-  // Update previous error
-  prevError = error;
-  lastSpeed = currentSpeed;
-
-  if(PID_DEBUG){
-    // Print PID values for debugging
-    Serial.print("Target Speed: ");
-    Serial.print(targetSpeed);
-    Serial.print(" RPM, Current Speed: ");
-    Serial.print(currentSpeed);
-    Serial.print(" RPM, Error: ");
-    Serial.print(error);
-    Serial.print(", Integral: ");
-    Serial.print(integral);
-    Serial.print(", Derivative: ");
-    Serial.print(derivative);
-   // Serial.print(", Kp: ");
-   // Serial.print(Kp);
-   // Serial.print(", Ki: ");
-   // Serial.print(Ki);
-   // Serial.print(", Kd: ");
-   // Serial.print(Kd);
-   Serial.print(", Output: ");
-    Serial.println(output);
-  }
-
-
-}
-// Set output limits for PID controller
-void PIDSetOutputLimits(float min, float max)
-{
-   if(min > max) return;
-   outputMin = min;
-   outputMax = max;
-    
-   if(output > outputMax) output = outputMax;
-   else if(output < outputMin) output = outputMin;
- 
-   if(integral> outputMax) integral= outputMax;
-   else if(integral< outputMin) integral= outputMin;
-}
-// Set tunings for PID
-void PIDSetTunings(float Kp_in, float Ki_in, float Kd_in)
-{
-  if(Kp_in < 0 || Ki_in < 0 || Kd_in < 0) return;
-  // Set PID tunings
-  Kp = Kp_in;
-  Ki = Ki_in * speedTimeRate;
-  Kd = Kd_in / speedTimeRate;
-}
-
 // Serial print of variable resistor values
-void debugVarRes(){
+void debugVarResRaw(){
   Serial.println("Analog Readings:");
   Serial.print("TickRes: ");
   Serial.println(analogRead(TickRes));
@@ -253,17 +155,38 @@ void debugVarRes(){
   Serial.println("~~~~");
 }
 
+void manualPIDControl(){
+  targetTick = map(analogRead(TickRes),0,PWM_MAX,-3000,3000);
+  float Kp_loc = map(analogRead(KpRes),0,PWM_MAX,0,1000);
+  float Ki_loc = map(analogRead(KiRes),0,PWM_MAX,0,1000)/1.0;
+  float Kd_loc = map(analogRead(KdRes),0,PWM_MAX,0,10);
+  pidController.PIDSetTunings(Kp_loc, Ki_loc, Kd_loc);
+
+  if(DEBUG_MANUAL_PID){
+  Serial.print("Target_Tick:");  
+  Serial.println(targetTick);
+  Serial.print("Kp:");
+  Serial.println(Kp_loc);
+  Serial.print("Ki:");
+  Serial.println(Ki_loc);
+  Serial.print("Kd:");
+  Serial.println(Kd_loc);
+  }
+}
+
+void pwmControl(){
+  // Only supports forward for now
+  motorControl.setDirection(motorController::FORWARD);
+  int pwmMotor = map(analogRead(TickRes),0,PWM_MAX,0,PWM_MAX);
+  motorControl.setPWMOut(pwmMotor);
+}
+
 void setup()
 {
   Serial.begin(9600);
 
-  // Motor control pins setup
-  pinMode(ENA, OUTPUT);
-  pinMode(IN1, OUTPUT);
-  pinMode(IN2, OUTPUT);
-
   // debug reverse encoder directionpin 
-  pinMode(PB5,OUTPUT);
+  //pinMode(PB5,OUTPUT);
 
   // Analog input pins
   analogReadResolution(PWM_RES);
@@ -272,13 +195,16 @@ void setup()
   pinMode(KiRes, INPUT_ANALOG);
   pinMode(KdRes, INPUT_ANALOG);
 
-  // Motor control setup
-  analogWriteResolution(PWM_RES); // Set PWM resolution
-  //analogWrite(ENA, PWM_MAX/2); // Set PWM to 50% duty cycle
-  digitalWrite(IN1, 1);
-  digitalWrite(IN2, 0);
-  PIDSetOutputLimits(0, PWM_MAX); // Set output limits for PID controller
-  
+  motorControl.setDirection(motorDir); // Set motor to off
+  motorControl.setPWMOut(0); // Set motor PWM to zero
+
+  // PID controller setup and initial values
+  pidController.PIDSetOutputLimits(0, PWM_MAX); // Set output limits for PID controller
+  float Kp_loc = map(analogRead(KpRes),0,PWM_MAX,0,1000);
+  float Ki_loc = map(analogRead(KiRes),0,PWM_MAX,0,1000)/1.0;
+  float Kd_loc = map(analogRead(KdRes),0,PWM_MAX,0,10);
+  pidController.PIDSetTunings(Kp_loc, Ki_loc, Kd_loc);
+
   // Start speed timer
   SpeedTimer->setOverflow(SPEED_UPDATE_RATE_HZ,HERTZ_FORMAT); // Update speed at the set Hz rate
   SpeedTimer->attachInterrupt(calcTickPerSecSimple); // Attach the speed calculation function to the timer
@@ -289,23 +215,20 @@ void setup()
 
 void loop()
 {
+  if(DEBUG_VAR_RES_RAW){
+    debugVarResRaw();
+  }
+  if(DEBUG_ENCODER_READINGS){
   debugEncoderReadings();
-  delay(100);
-
-
-  targetTick = map(analogRead(TickRes),0,PWM_MAX,0,3000);
+  }
+  //manualPIDControl();
+  //pwmControl();
   Serial.print("Target_Tick:");  
   Serial.println(targetTick);
-  float Kp_loc = map(analogRead(KpRes),0,PWM_MAX,0,1000);
-  float Ki_loc = map(analogRead(KiRes),0,PWM_MAX,0,1000)/1.0;
-  float Kd_loc = map(analogRead(KdRes),0,PWM_MAX,0,10);
-  //Kd_loc = 0;
-  PIDSetTunings(Kp_loc, Ki_loc, Kd_loc);
-  Serial.print("Kp:");
-  Serial.println(Kp_loc);
-  Serial.print("Ki:");
-  Serial.println(Ki_loc);
-  Serial.print("Kd:");
-  Serial.println(Kd_loc);
-  //debugVarRes();
+  targetTick++;
+  if(targetTick>3000){
+    targetTick = -3000;
+  }
+  
+  delay(100);
 }
