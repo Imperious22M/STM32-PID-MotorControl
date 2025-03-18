@@ -86,8 +86,7 @@ void calcTickPerSecSimple()
   if(prevTickCnt == curTickCnt){
       ticksPerSec = 0;
   }else {
-    // Calculate Ticks/Second based on direction
-
+    // Calculate Ticks/Second based on the difference of tick CNT
     if(curTickCnt>prevTickCnt){
         ticksPerSec = (curTickCnt - prevTickCnt) / (speedTimeRate);
         direction = 0;
@@ -101,9 +100,9 @@ void calcTickPerSecSimple()
     // and correct the count to account for this
     if(ticksPerSec>UINT16_MAX){
       if(direction==0){
-        ticksPerSec = (prevTickCnt + (UINT16_MAX - curTickCnt - 1)) / (speedTimeRate);
+        ticksPerSec = (prevTickCnt + (UINT16_MAX - curTickCnt)) / (speedTimeRate);
       }else{
-        ticksPerSec = (curTickCnt + (UINT16_MAX - prevTickCnt - 1)) / (speedTimeRate);
+        ticksPerSec = (curTickCnt + (UINT16_MAX - prevTickCnt)) / (speedTimeRate);
       }
     }
 
