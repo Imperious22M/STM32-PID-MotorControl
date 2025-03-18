@@ -1,8 +1,10 @@
 #include <Arduino.h>
-#include <stm32yyxx_ll_tim.h>
-#include <quadratureDecoder.h>
 #include <SPI.h>
 #include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <stm32yyxx_ll_tim.h>
+#include <quadratureDecoder.h>
 #include <Adafruit_MCP2515.h>
 #include <pidController.h>
 #include <motorController.h>
@@ -16,6 +18,12 @@
 #error "Due to API change, this sketch is compatible with STM32_CORE_VERSION  >= 0x01090000"
 #endif
 
+// OLED display 
+#define SCREEN_WIDTH 128 // OLED display width, in pixels
+#define SCREEN_HEIGHT 32 // OLED display height, in pixels
+#define OLED_RESET     -1 // Reset pin # (or -1 if sharing Arduino reset pin)
+#define SCREEN_ADDRESS 0x3C ///< See datasheet for Address; 0x3D for 128x64, 
+
 // Qudrature decoder pin definitions
 #define T1CH1_Pin PA8 // Quadrature A channel input pin
 #define T1CH2_Pin PA9 // Quadrature B channel input pin
@@ -24,13 +32,15 @@
 #define ENA PB8
 #define IN1 PB7
 #define IN2 PB6
-#define ticksPerRevolution 1800 // Number of "ticks" per revolution
+#define ticksPerRevolution 2222 // Number of "ticks" per revolution
 
 // Speed update rate in HZ
 #define SPEED_UPDATE_RATE_HZ 20
 const float speedTimeRate =  1.0/SPEED_UPDATE_RATE_HZ; // Period of update rate
 volatile uint16_t prevTickCnt = 0; // Previously stored Tick Count, initialized to zero upon reset
 volatile float ticksPerSec = 0; // Ticks per second of the encoder
+int averageRPM = 0; // Average RPM of the motor
+
 
 // PWM settings
 #define PWM_RES 16 // PWM resolution in bits
@@ -56,10 +66,14 @@ QuadratureDecoder quadDecoder(TIM1, T1CH1_Pin, T1CH2_Pin);
 HardwareTimer *SpeedTimer = new HardwareTimer(TIMER_SERVO);
 // PID Controller for motor PWM control
 PIDController pidController(speedTimeRate, 0, PWM_MAX, 0, 0, 0); 
-int targetTick = 1800; // Target speed in ticks/second
+int targetTick = 0; // Target speed in ticks/second
 // Motor Controller initialization
 motorController motorControl = motorController(ENA, IN1, IN2,PWM_RES);
 motorController::motorDirection motorDir = motorController::FORWARD;
+// Use SDA/SCL2 pins
+TwoWire Wire2(PB11, PB10); // Create a new Wire instance for the OLED display
+// Display Object
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire2, OLED_RESET);
 
 // Calculates ticks/second at  a rate of SPEED_UPDATE_HZ
 // Use direction as discriminant and account for over/underflow
@@ -133,12 +147,15 @@ void debugEncoderReadings(){
   //Serial.print("Direction:");
   //Serial.println(quadDecoder.getDirBit()? "Backward":"Forward");
   //Serial.println(quadDecoder.getDirBit());
+  averageRPM = (averageRPM + (ticksPerSec/ticksPerRevolution*60))/2;
   Serial.print("Ticks_per_second:");
   Serial.println(ticksPerSec);
   Serial.print("RPS:");
-  Serial.println(ticksPerSec/ticksPerRevolution);
+  Serial.print(ticksPerSec/ticksPerRevolution);
   Serial.print("RPM:");
   Serial.println(ticksPerSec/ticksPerRevolution*60);
+  Serial.print("Average RPM:");
+  Serial.println(averageRPM);
   //Serial.println("~~~~");
 }
 // Serial print of variable resistor values
@@ -181,12 +198,36 @@ void pwmControl(){
   motorControl.setPWMOut(pwmMotor);
 }
 
+// Display helper function
+void displayControl(){
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.print("Target TPS: ");;
+  display.println(targetTick);  // Print the last part;
+  display.print("TPS: ");;
+  display.println(ticksPerSec);  // Print the last part;
+  display.print("RPS: ");
+  display.print(ticksPerSec/ticksPerRevolution);
+  display.print(" RPM: ");
+  display.println(ticksPerSec/ticksPerRevolution*60);
+  display.print("Avg RPM: ");
+  display.println(averageRPM);
+  display.display();
+}
+
 void setup()
 {
   Serial.begin(9600);
 
-  // debug reverse encoder directionpin 
-  //pinMode(PB5,OUTPUT);
+  // Initialize the OLED display
+  if(!display.begin(SSD1306_SWITCHCAPVCC,SCREEN_ADDRESS)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for(;;); // Don't proceed, loop forever
+  }
+  display.display();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0,0);
 
   // Analog input pins
   analogReadResolution(PWM_RES);
@@ -221,14 +262,20 @@ void loop()
   if(DEBUG_ENCODER_READINGS){
   debugEncoderReadings();
   }
-  //manualPIDControl();
+
+  // Control PID 
+  manualPIDControl();
+  
   //pwmControl();
   Serial.print("Target_Tick:");  
   Serial.println(targetTick);
-  targetTick++;
-  if(targetTick>3000){
-    targetTick = -3000;
-  }
+  //targetTick++;
+  //if(targetTick>3000){
+  //  targetTick = -3000;
+  //}
+
+  // Update OLED display
+  displayControl();
   
   delay(100);
 }
